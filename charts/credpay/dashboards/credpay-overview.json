@@ -1,0 +1,143 @@
+{
+  "uid": "credpay-overview",
+  "title": "CREDPAY - Service Overview",
+  "description": "Traffic, errors, latency and resources of the CREDPAY services (one environment = one namespace).",
+  "tags": ["credpay"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "prometheus" }
+      },
+      {
+        "name": "namespace",
+        "label": "Environment",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": { "query": "label_values(kube_namespace_status_phase{namespace=~\"credpay-.*\"}, namespace)", "refId": "ns" },
+        "definition": "label_values(kube_namespace_status_phase{namespace=~\"credpay-.*\"}, namespace)",
+        "refresh": 2,
+        "current": { "selected": true, "text": "credpay-prod", "value": "credpay-prod" }
+      }
+    ]
+  },
+  "panels": [
+    { "type": "row", "title": "Traffic", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1, "collapsed": false, "panels": [] },
+    {
+      "id": 2, "type": "timeseries", "title": "Requests per second",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "legendFormat": "{{service}}", "expr": "sum by (service) (rate(http_server_requests_seconds_count{namespace=\"$namespace\", uri!~\"/actuator.*|/health.*|/metrics\"}[5m])) or sum by (service) (rate(http_requests_total{namespace=\"$namespace\", handler!~\"/health.*|/metrics\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Error rate (5xx share)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit", "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "targets": [ { "refId": "A", "legendFormat": "{{service}}", "expr": "credpay:http_error_ratio:rate5m{namespace=\"$namespace\"}" } ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Response time (95th percentile)",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s", "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "targets": [ { "refId": "A", "legendFormat": "{{service}}", "expr": "credpay:http_latency_p95:rate5m{namespace=\"$namespace\"}" } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Payments (last hour)",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "sum(increase(http_requests_total{namespace=\"$namespace\", handler=\"/api/payment/pay\", status=\"2xx\"}[1h]))" } ]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Failed payments (last hour)",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short", "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "refId": "A", "expr": "sum(increase(http_requests_total{namespace=\"$namespace\", handler=\"/api/payment/pay\", status=\"5xx\"}[1h])) or vector(0)" } ]
+    },
+    {
+      "id": 7, "type": "stat", "title": "Firing alerts",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short", "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "refId": "A", "expr": "count(ALERTS{alertstate=\"firing\", namespace=\"$namespace\"}) or vector(0)" } ]
+    },
+    {
+      "id": 8, "type": "stat", "title": "Services up",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [ { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ]
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "value_and_name" },
+      "targets": [ { "refId": "A", "legendFormat": "{{job}}", "expr": "min by (job) (up{namespace=\"$namespace\"})" } ]
+    },
+    { "type": "row", "title": "Kubernetes", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }, "id": 9, "collapsed": false, "panels": [] },
+    {
+      "id": 10, "type": "timeseries", "title": "CPU per pod (cores)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [ { "refId": "A", "legendFormat": "{{pod}}", "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", container!=\"\"}[5m]))" } ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Memory per pod",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [ { "refId": "A", "legendFormat": "{{pod}}", "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", container!=\"\"})" } ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Container restarts (last 15 min)",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "targets": [ { "refId": "A", "legendFormat": "{{pod}}", "expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"$namespace\"}[15m]))" } ]
+    }
+  ]
+}

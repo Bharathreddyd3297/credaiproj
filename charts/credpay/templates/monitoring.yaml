@@ -1,0 +1,197 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := .Release.Namespace -}}
+{{- $env := .Values.environment -}}
+# =====================================================================
+# Monitoring for this environment (needs kube-prometheus-stack, which
+# selects ServiceMonitors / PrometheusRules from every namespace)
+# =====================================================================
+{{- if .Values.monitoring.serviceMonitors }}
+{{- range $sm := list
+      (dict "name" "user-service" "port" "http" "path" "/actuator/prometheus")
+      (dict "name" "payment-service" "port" "http" "path" "/metrics")
+      (dict "name" "keycloak" "port" "management" "path" "/metrics")
+      (dict "name" "ai-service" "port" "http" "path" "/metrics" "enabled" $.Values.aiops.enabled) }}
+{{- if (hasKey $sm "enabled" | ternary $sm.enabled true) }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $sm.name }}
+  labels:
+    {{- include "credpay.labels" (dict "name" $sm.name "root" $) | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" $sm.name) | nindent 6 }}
+  endpoints:
+    - port: {{ $sm.port }}
+      path: {{ $sm.path }}
+      interval: {{ $.Values.monitoring.scrapeInterval }}
+      # Same labels on every series: environment and service
+      relabelings:
+        - targetLabel: environment
+          replacement: {{ $env }}
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          targetLabel: service
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.monitoring.alertRules }}
+---
+# =====================================================================
+# CREDPAY alerts. Labels used by Alertmanager routing (Slack, ...):
+#   severity: critical | warning   team: credpay   environment: <env>
+# Runbooks: docs/OBSERVABILITY.md#alerts
+# =====================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: credpay-alerts
+  labels:
+    {{- include "credpay.labels" (dict "name" "credpay-alerts" "root" .) | nindent 4 }}
+spec:
+  groups:
+    - name: credpay.availability
+      rules:
+        - alert: CredpayServiceDown
+          expr: up{namespace="{{ $ns }}", job=~"user-service|payment-service|keycloak"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.job }}" }} is down in {{ $env }}"
+            description: "Prometheus cannot scrape {{ "{{ $labels.job }}" }} ({{ "{{ $labels.pod }}" }}) for 2 minutes."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpayservicedown
+
+        - alert: CredpayDeploymentUnavailable
+          expr: |
+            kube_deployment_status_replicas_available{namespace="{{ $ns }}"}
+              < kube_deployment_spec_replicas{namespace="{{ $ns }}"}
+          for: 10m
+          labels:
+            severity: warning
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.deployment }}" }} has unavailable replicas in {{ $env }}"
+            description: "{{ "{{ $labels.deployment }}" }}: fewer replicas available than desired for 10 minutes."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpaydeploymentunavailable
+
+        - alert: CredpayPodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}"}[15m]) > 3
+          labels:
+            severity: critical
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} keeps restarting in {{ $env }}"
+            description: "Container {{ "{{ $labels.container }}" }} restarted {{ "{{ $value | humanize }}" }} times in 15 minutes."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpaypodcrashlooping
+
+    - name: credpay.traffic
+      rules:
+        # Share of requests answered with 5xx, per service. Health checks
+        # and metrics scrapes are left out: they are not user traffic (and
+        # Keycloak's readiness check answers 503 while it starts).
+        # ("errors or total * 0": a service with traffic but no errors gets 0, not "no data")
+        - record: credpay:http_error_ratio:rate5m
+          expr: |
+            (
+              (
+                sum by (namespace, service) (rate(http_server_requests_seconds_count{namespace="{{ $ns }}", uri!~"/actuator.*|/health.*|/metrics", status=~"5.."}[5m]))
+                or sum by (namespace, service) (rate(http_server_requests_seconds_count{namespace="{{ $ns }}", uri!~"/actuator.*|/health.*|/metrics"}[5m])) * 0
+              )
+              / sum by (namespace, service) (rate(http_server_requests_seconds_count{namespace="{{ $ns }}", uri!~"/actuator.*|/health.*|/metrics"}[5m]))
+            )
+            or
+            (
+              (
+                sum by (namespace, service) (rate(http_requests_total{namespace="{{ $ns }}", handler!~"/health.*|/metrics", status="5xx"}[5m]))
+                or sum by (namespace, service) (rate(http_requests_total{namespace="{{ $ns }}", handler!~"/health.*|/metrics"}[5m])) * 0
+              )
+              / sum by (namespace, service) (rate(http_requests_total{namespace="{{ $ns }}", handler!~"/health.*|/metrics"}[5m]))
+            )
+
+        # 95th percentile response time, per service (seconds)
+        - record: credpay:http_latency_p95:rate5m
+          expr: |
+            histogram_quantile(0.95, sum by (namespace, service, le) (rate(http_server_requests_seconds_bucket{namespace="{{ $ns }}", uri!~"/actuator.*|/health.*|/metrics"}[5m])))
+            or
+            histogram_quantile(0.95, sum by (namespace, service, le) (rate(http_request_duration_seconds_bucket{namespace="{{ $ns }}", handler!~"/health.*|/metrics"}[5m])))
+
+        - alert: CredpayHighErrorRate
+          expr: credpay:http_error_ratio:rate5m{namespace="{{ $ns }}"} > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.service }}" }}: more than 5% of requests fail in {{ $env }}"
+            description: "{{ "{{ $value | humanizePercentage }}" }} of {{ "{{ $labels.service }}" }} requests returned 5xx over 5 minutes."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpayhigherrorrate
+
+        - alert: CredpayHighLatency
+          expr: credpay:http_latency_p95:rate5m{namespace="{{ $ns }}"} > 1
+          for: 10m
+          labels:
+            severity: warning
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.service }}" }} is slow in {{ $env }}"
+            description: "95% of {{ "{{ $labels.service }}" }} requests take up to {{ "{{ $value | humanizeDuration }}" }} (threshold 1s)."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpayhighlatency
+
+        - alert: CredpayPaymentErrors
+          expr: sum(increase(http_requests_total{namespace="{{ $ns }}", service="payment-service", handler="/api/payment/pay", status="5xx"}[10m])) > 3
+          labels:
+            severity: critical
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "Payments are failing in {{ $env }}"
+            description: "{{ "{{ $value | humanize }}" }} payment requests failed with a server error in the last 10 minutes."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpaypaymenterrors
+
+    - name: credpay.resources
+      rules:
+        - alert: CredpayContainerMemoryHigh
+          expr: |
+            max by (namespace, pod, container) (container_memory_working_set_bytes{namespace="{{ $ns }}", container!=""})
+              / max by (namespace, pod, container) (kube_pod_container_resource_limits{namespace="{{ $ns }}", resource="memory"})
+              > 0.9
+          for: 15m
+          labels:
+            severity: warning
+            team: credpay
+            environment: {{ $env }}
+          annotations:
+            summary: "{{ "{{ $labels.container }}" }} uses over 90% of its memory limit in {{ $env }}"
+            description: "{{ "{{ $labels.pod }}" }}/{{ "{{ $labels.container }}" }} is at {{ "{{ $value | humanizePercentage }}" }} of its memory limit and may be OOM-killed."
+            runbook_url: https://dev.azure.com/bharathreddy3297/Flipkart-Capestone/_git/credwithaiops?path=/docs/OBSERVABILITY.md&anchor=credpaycontainermemoryhigh
+{{- end }}
+
+{{- if .Values.monitoring.dashboards }}
+---
+# Grafana dashboard - Grafana's sidecar loads every ConfigMap labelled
+# grafana_dashboard=1 (k8s/platform/monitoring/kube-prometheus-stack-values.yaml)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credpay-dashboards
+  labels:
+    {{- include "credpay.labels" (dict "name" "credpay-dashboards" "root" .) | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: CREDPAY
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

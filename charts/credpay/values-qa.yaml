@@ -1,0 +1,13 @@
+# qa - same images as dev, promoted after dev's smoke tests (and an
+# optional approval). Kept small: it shares the cluster with dev and prod.
+environment: qa
+
+keycloak:
+  resources:
+    requests: { cpu: 100m, memory: 640Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+userService:
+  resources:
+    requests: { cpu: 50m, memory: 384Mi }
+    limits: { cpu: "1", memory: 768Mi }

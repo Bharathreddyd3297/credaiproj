@@ -1,0 +1,131 @@
+# =====================================================================
+# Deploy one environment (dev | qa | prod) - used three times by
+# pipelines/credpay-cd.yml.
+#
+#   Azure DevOps Environment credpay-<env>: add "Approvals and checks"
+#   there (Pipelines -> Environments) to require a person before qa/prod.
+#
+# Build once, promote: the first environment (dev) decides which image
+# tags to deploy and publishes them as the artifact "images"; qa and prod
+# deploy exactly that list - never a newer, untested tag.
+# =====================================================================
+parameters:
+  - name: env                # dev | qa | prod
+    type: string
+  - name: dependsOn
+    type: object
+  - name: resolveImages      # true for the first environment only
+    type: boolean
+    default: false
+
+stages:
+  - stage: ${{ upper(parameters.env) }}
+    displayName: Deploy ${{ parameters.env }}
+    dependsOn: ${{ parameters.dependsOn }}
+    variables:
+      resourceGroup: $[ stageDependencies.Infra.Terraform.outputs['tfout.resourceGroup'] ]
+      aksName: $[ stageDependencies.Infra.Terraform.outputs['tfout.aksName'] ]
+      ingressIp: $[ stageDependencies.Infra.Terraform.outputs['tfout.ingressIp'] ]
+      keyVaultName: $[ stageDependencies.Infra.Terraform.outputs['tfout.keyVaultName'] ]
+    jobs:
+      - deployment: Deploy_${{ parameters.env }}
+        displayName: Deploy to credpay-${{ parameters.env }}
+        environment: credpay-${{ parameters.env }}
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - ${{ if parameters.resolveImages }}:
+                    # image-<service> artifacts of the CI run (only the
+                    # services that run built); the rest come from ACR
+                    - download: ci
+                      displayName: Download CI image references
+                      patterns: image-*/*.txt
+                      continueOnError: true
+                - ${{ else }}:
+                    - download: current
+                      displayName: Download the image list deployed to dev
+                      artifact: images
+
+                - bash: scripts/cd/install-tools.sh
+                  displayName: Install terraform, kustomize, helm
+                  env:
+                    TERRAFORM_VERSION: $(terraformVersion)
+                    KUSTOMIZE_VERSION: $(kustomizeVersion)
+                    HELM_VERSION: $(helmVersion)
+
+                - task: AzureKeyVault@2
+                  displayName: Read secrets from Key Vault
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    KeyVaultName: $(keyVaultName)
+                    SecretsFilter: postgres-host,postgres-username,postgres-password,keycloak-admin-username,keycloak-admin-password
+                    RunAsPreJob: false
+
+                # Azure OpenAI / Dynatrace - each optional
+                - task: AzureCLI@2
+                  displayName: Read optional integrations from Key Vault
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: scriptPath
+                    scriptPath: scripts/cd/read-optional-secrets.sh
+                    arguments: $(keyVaultName)
+
+                - task: AzureCLI@2
+                  displayName: Deploy (helm) and smoke test
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      domain="$(baseDomain)"
+                      if [ -z "$domain" ]; then
+                        domain="$(echo "$(ingressIp)" | tr . -).sslip.io"
+                      fi
+                      echo "Domain: $domain"
+
+                      scripts/cd/aks-login.sh "$(resourceGroup)" "$(aksName)"
+
+                      images="$(Build.ArtifactStagingDirectory)/images/images.txt"
+                      mkdir -p "$(dirname "$images")"
+                      if [ "${{ parameters.resolveImages }}" = "True" ]; then
+                        scripts/cd/resolve-images.sh "$images" "$(Pipeline.Workspace)/ci" "$(acrName)"
+                      else
+                        cp "$(Pipeline.Workspace)/images/images.txt" "$images"
+                        echo "Promoting the images deployed to dev:"; sed 's/^/  /' "$images"
+                      fi
+
+                      DOMAIN="$domain" IMAGES_FILE="$images" \
+                      GRAFANA_URL="https://grafana.$domain" \
+                        scripts/cd/deploy-app.sh ${{ parameters.env }}
+                  env:
+                    TLS_ISSUER: $(tlsIssuer)
+                    OUT_DIR: $(Build.ArtifactStagingDirectory)/deploy
+                    DB_HOST: $(postgres-host)
+                    DB_USERNAME: $(postgres-username)
+                    DB_PASSWORD: $(postgres-password)
+                    KC_ADMIN_USERNAME: $(keycloak-admin-username)
+                    KC_ADMIN_PASSWORD: $(keycloak-admin-password)
+                    # secret variables must be mapped explicitly
+                    OPENAI_KEY: $(OPENAI_KEY)
+                    DYNATRACE_API_TOKEN: $(DYNATRACE_API_TOKEN)
+                    DYNATRACE_PROBLEMS_TOKEN: $(DYNATRACE_PROBLEMS_TOKEN)
+
+                - ${{ if parameters.resolveImages }}:
+                    - task: PublishPipelineArtifact@1
+                      displayName: Publish the image list (promoted to qa and prod)
+                      inputs:
+                        targetPath: $(Build.ArtifactStagingDirectory)/images
+                        artifact: images
+
+                - task: PublishPipelineArtifact@1
+                  displayName: Publish rendered manifests and smoke tests
+                  condition: succeededOrFailed()
+                  inputs:
+                    targetPath: $(Build.ArtifactStagingDirectory)/deploy
+                    artifact: deploy-${{ parameters.env }}-$(System.JobAttempt)

@@ -1,0 +1,26 @@
+{{- $customer := include "credpay.customerHost" . -}}
+{{- $admin := include "credpay.adminHost" . -}}
+{{- $auth := include "credpay.authHost" . -}}
+# Non-secret settings shared by every component of this environment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credpay-config
+  labels:
+    {{- include "credpay.labels" (dict "name" "credpay-config" "root" .) | nindent 4 }}
+data:
+  CUSTOMER_HOST: {{ $customer | quote }}
+  ADMIN_HOST: {{ $admin | quote }}
+  AUTH_HOST: {{ $auth | quote }}
+  CUSTOMER_PORTAL_URL: {{ printf "https://%s" $customer | quote }}
+  ADMIN_PORTAL_URL: {{ printf "https://%s" $admin | quote }}
+  KEYCLOAK_URL: {{ printf "https://%s" $auth | quote }}
+  OIDC_ISSUER_URI: {{ include "credpay.issuerUri" . | quote }}
+  OIDC_AUDIENCE: {{ .Values.oidc.audience | quote }}
+  # Signing keys are fetched inside the cluster; the issuer stays public
+  OIDC_JWKS_URI: "http://keycloak:8080/realms/credpay/protocol/openid-connect/certs"
+  CORS_ALLOWED_ORIGINS: {{ printf "https://%s,https://%s" $customer $admin | quote }}
+  APP_DB_NAME: {{ include "credpay.appDbName" . | quote }}
+  KEYCLOAK_DB_NAME: {{ include "credpay.keycloakDbName" . | quote }}
+  DB_PORT: {{ .Values.database.port | quote }}
+  TLS_ISSUER: {{ .Values.tls.issuer | quote }}

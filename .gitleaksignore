@@ -1,0 +1,8 @@
+# gitleaks findings reviewed and accepted as false positives.
+# Format: <commit>:<file>:<rule>:<line>   (gitleaks prints this fingerprint)
+#
+# Rule curl-auth-user in the SonarQube step of build-service.yml: the
+# "password" is a shell variable filled at run time, not a secret. The
+# line now has an inline gitleaks:allow; this entry covers the commit
+# before that comment was added.
+d410609baa1f9c037ccc7c7a1b81d4278b0dbf63:pipelines/templates/build-service.yml:curl-auth-user:142

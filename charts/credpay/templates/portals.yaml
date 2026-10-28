@@ -1,0 +1,93 @@
+# =====================================================================
+# Customer portal and admin portal (React + nginx). The same image runs
+# everywhere: Keycloak's address is written to /config.js at start-up
+# from CREDPAY_* variables. API calls go to the same host (/api/...),
+# routed by the ingress - no CORS needed.
+# =====================================================================
+{{- range $portal := list
+      (dict "name" "customer-portal" "values" .Values.customerPortal "key" "customerPortal")
+      (dict "name" "admin-portal" "values" .Values.adminPortal "key" "adminPortal") }}
+{{- $c := $portal.values }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $portal.name }}
+  labels:
+    {{- include "credpay.labels" (dict "name" $portal.name "root" $) | nindent 4 }}
+spec:
+  replicas: {{ $c.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" $portal.name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "credpay.labels" (dict "name" $portal.name "root" $) | nindent 8 }}
+      annotations:
+        {{- include "credpay.configChecksum" $ | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $portal.name }}
+          image: {{ include "credpay.image" (dict "key" $portal.key "image" $c.image) }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: CREDPAY_OIDC_AUTHORITY
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: OIDC_ISSUER_URI }
+            - name: CREDPAY_OIDC_CLIENT_ID
+              value: {{ $portal.name }}
+            # APIs are on the same host (routed by the ingress). Must be set
+            # explicitly: the images' built-in defaults are for npm run dev.
+            - name: CREDPAY_USER_API_URL
+              value: ""
+            - name: CREDPAY_PAYMENT_API_URL
+              value: ""
+            {{- if eq $portal.name "admin-portal" }}
+            # Monitoring page: the AIOps API (same host, /api/ai) and links
+            - name: CREDPAY_AI_API_URL
+              value: ""
+            - name: CREDPAY_AIOPS_ENABLED
+              value: {{ $.Values.aiops.enabled | quote }}
+            - name: CREDPAY_GRAFANA_URL
+              value: {{ $.Values.aiops.links.grafana | quote }}
+            - name: CREDPAY_DYNATRACE_URL
+              value: {{ $.Values.aiops.links.dynatrace | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp # nginx temp files + generated /tmp/runtime/config.js
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $portal.name }}
+  labels:
+    {{- include "credpay.labels" (dict "name" $portal.name "root" $) | nindent 4 }}
+spec:
+  selector:
+    {{- include "credpay.selectorLabels" (dict "name" $portal.name) | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

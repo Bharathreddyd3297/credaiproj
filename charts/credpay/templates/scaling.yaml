@@ -1,0 +1,56 @@
+# =====================================================================
+# Autoscaling (HPA on CPU) and disruption budgets - used in prod.
+# HPAs need the metrics-server, which AKS runs by default.
+# =====================================================================
+{{- range $svc := list
+      (dict "name" "user-service" "values" .Values.userService)
+      (dict "name" "payment-service" "values" .Values.paymentService) }}
+{{- $a := $svc.values.autoscaling }}
+{{- if $a.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $svc.name }}
+  labels:
+    {{- include "credpay.labels" (dict "name" $svc.name "root" $) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $svc.name }}
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- range $c := list
+      (dict "name" "keycloak" "replicas" .Values.keycloak.replicas "hpa" false)
+      (dict "name" "user-service" "replicas" .Values.userService.replicas "hpa" .Values.userService.autoscaling.enabled)
+      (dict "name" "payment-service" "replicas" .Values.paymentService.replicas "hpa" .Values.paymentService.autoscaling.enabled)
+      (dict "name" "customer-portal" "replicas" .Values.customerPortal.replicas "hpa" false)
+      (dict "name" "admin-portal" "replicas" .Values.adminPortal.replicas "hpa" false) }}
+{{- if or $c.hpa (gt (int $c.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $c.name }}
+  labels:
+    {{- include "credpay.labels" (dict "name" $c.name "root" $) | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" $c.name) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

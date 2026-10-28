@@ -1,0 +1,151 @@
+# =====================================================================
+# CREDPAY Helm chart - default values
+# =====================================================================
+# Per environment: values-dev.yaml, values-qa.yaml, values-prod.yaml.
+# Per deployment (set by scripts/cd/deploy-app.sh with --set):
+#   environment, domain, tls.issuer, <component>.image
+#
+# Secrets are NOT in values. The CD pipeline creates them from Key Vault
+# before `helm upgrade` (names below), so no secret ever passes through
+# Helm or ends up in a release record:
+#   credpay-db      DB_HOST, DB_USERNAME, DB_PASSWORD
+#   keycloak-admin  username, password
+#   credpay-aiops   OPENAI_*, DYNATRACE_*   (optional - only with aiops)
+#
+#   helm template credpay charts/credpay -f charts/credpay/values-dev.yaml \
+#     --set domain=example.com --set-string userService.image=... (see README)
+# =====================================================================
+
+# dev | qa | prod - namespace is credpay-<environment> (created by the pipeline)
+environment: dev
+
+# Hosts: <environment>.<domain>, admin.<environment>.<domain>, auth.<environment>.<domain>
+domain: example.invalid
+hosts:
+  customer: ""   # override the computed host names if needed
+  admin: ""
+  auth: ""
+
+tls:
+  # ClusterIssuer from k8s/platform/cluster-issuers.yaml:
+  # letsencrypt-prod | letsencrypt-staging | selfsigned
+  issuer: letsencrypt-prod
+  secretName: credpay-tls
+
+ingress:
+  className: traefik
+
+database:
+  port: 5432
+  # Empty = credpay_<environment> / keycloak_<environment> (created by Terraform)
+  appName: ""
+  keycloakName: ""
+  # Azure PostgreSQL requires TLS; set to "" for a local, plain database
+  keycloakUrlProperties: "?sslmode=require"
+
+oidc:
+  audience: credpay-api
+
+# Shared pod/container hardening (Pod Security Standard "restricted")
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ---------------------------------------------------------------------
+# Components. image = full reference, e.g.
+# creddemoacr.azurecr.io/credpay/user-service:1.0.123 (required)
+# ---------------------------------------------------------------------
+keycloak:
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 200m, memory: 768Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+userService:
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: "1", memory: 768Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+paymentService:
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  # Day boundaries for the admin reports
+  reportTimezone: Asia/Kolkata
+
+customerPortal:
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+adminPortal:
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# Keep at least one pod of each multi-replica service during node
+# upgrades and drains (only for components with more than one replica)
+podDisruptionBudget:
+  enabled: false
+
+# ---------------------------------------------------------------------
+# Observability (needs the monitoring stack from k8s/platform:
+# kube-prometheus-stack in namespace "monitoring")
+# ---------------------------------------------------------------------
+monitoring:
+  enabled: false
+  # ServiceMonitors: Prometheus scrapes the services' metrics endpoints
+  serviceMonitors: true
+  scrapeInterval: 30s
+  # PrometheusRules: CREDPAY alerts (routed by Alertmanager)
+  alertRules: true
+  # Grafana dashboards (ConfigMaps picked up by Grafana's sidecar)
+  dashboards: true
+  # Dynatrace: annotate pods so Dynatrace also ingests their Prometheus
+  # metrics (needs the Dynatrace Operator, k8s/platform/dynatrace)
+  dynatraceMetrics: false
+
+# ---------------------------------------------------------------------
+# AIOps: ai-service (admin-only API at https://<admin host>/api/ai)
+# ---------------------------------------------------------------------
+aiops:
+  enabled: false
+  image: ""
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  # Set by deploy-app.sh: hash of the credpay-aiops Secret's settings
+  # (a change restarts ai-service so it reads the new values)
+  settingsChecksum: ""
+  prometheusUrl: http://monitoring-prometheus.monitoring.svc.cluster.local:9090
+  alertmanagerUrl: http://monitoring-alertmanager.monitoring.svc.cluster.local:9093
+  # Links shown in the admin portal's Monitoring page (optional)
+  links:
+    grafana: ""
+    dynatrace: ""

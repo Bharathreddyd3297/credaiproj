@@ -1,0 +1,85 @@
+{{- $c := .Values.paymentService -}}
+# =====================================================================
+# payment-service (FastAPI): bill payments and payment history.
+# Uses the tables created by user-service (Flyway). Metrics: /metrics
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "payment-service" "root" .) | nindent 4 }}
+spec:
+  {{- if not $c.autoscaling.enabled }}
+  replicas: {{ $c.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" "payment-service") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "credpay.labels" (dict "name" "payment-service" "root" .) | nindent 8 }}
+      annotations:
+        {{- include "credpay.configChecksum" . | nindent 8 }}
+        {{- include "credpay.dynatraceScrape" (dict "root" . "port" 8000 "path" "/metrics") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: payment-service
+          image: {{ include "credpay.image" (dict "key" "paymentService" "image" $c.image) }}
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: credpay-config
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_HOST }
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_USERNAME }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_PASSWORD }
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: APP_DB_NAME }
+            - name: REPORT_TIMEZONE
+              value: {{ $c.reportTimezone | quote }}
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http } # checks the database
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "payment-service" "root" .) | nindent 4 }}
+spec:
+  selector:
+    {{- include "credpay.selectorLabels" (dict "name" "payment-service") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

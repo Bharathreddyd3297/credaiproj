@@ -1,0 +1,28 @@
+# =====================================================================
+# Trivy risk acceptances for the keycloak image
+# =====================================================================
+# Every entry needs: the reason it does not affect us, who accepted it,
+# and an expiry date (exp:). After that date Trivy reports it again and
+# the pipeline fails until someone fixes it or re-accepts it.
+#
+# Accepted 2026-10-23 (pending instructor review)
+# Short expiry on purpose: re-check when Keycloak publishes a new 26.x
+# patch image (bump the FROM lines in the Dockerfile and rescan).
+# =====================================================================
+
+# --- OS packages in the upstream ubi9-micro base image ---------------
+# The Keycloak image has no package manager, so these cannot be patched
+# in our Dockerfile; they are fixed when Keycloak rebuilds its image.
+
+# ca-certificates (CA trust store update)
+CVE-2026-114406 exp:2026-11-30
+
+# pcre2 / pcre2-syntax (regular-expression library)
+CVE-2026-103111 exp:2026-11-30
+CVE-2026-86145 exp:2026-11-30
+CVE-2026-89161 exp:2026-11-30
+
+# --- Bundled JDBC driver that CredPay never loads --------------------
+# mssql-jdbc ships with Keycloak for SQL Server users. CredPay is built
+# with KC_DB=postgres (Dockerfile), so the SQL Server driver is not used.
+CVE-2025-59250 exp:2027-01-31

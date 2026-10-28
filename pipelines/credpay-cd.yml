@@ -1,0 +1,348 @@
+# =====================================================================
+# CREDPAY - CD pipeline: infrastructure + deployment
+# =====================================================================
+# Starts automatically when credpay-ci succeeds on main (or manually):
+#
+#   Infra     bootstrap state storage -> terraform plan
+#             -> terraform apply ONLY when the plan has changes
+#             (an unchanged infrastructure is skipped in seconds)
+#   Platform  Traefik + cert-manager, and the observability stack:
+#             Prometheus/Alertmanager/Grafana always; alerts to Slack and
+#             the Dynatrace Operator when their Key Vault secrets exist
+#             (helm upgrade: no-op when unchanged)
+#   DEV       Key Vault secrets -> Kubernetes Secrets -> helm upgrade of
+#             charts/credpay with the CI image tags -> smoke tests
+#   QA        the same images as dev (artifact "images")
+#   PROD      the same images, plus monitoring, AIOps, Dynatrace
+#
+# Approvals: Pipelines -> Environments -> credpay-qa / credpay-prod ->
+# Approvals and checks (the stage waits for a person there).
+#
+# Destroy: run manually with "Destroy all Azure infrastructure" ticked.
+#
+# Azure DevOps setup: Pipelines -> New pipeline -> Azure Repos Git ->
+# credwithaiops -> Existing YAML file -> /pipelines/credpay-cd.yml,
+# name it credpay-cd.
+# =====================================================================
+
+trigger: none   # started by the CI pipeline (resources below), not by pushes
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci
+      source: credpay-ci    # name of the CI pipeline in Azure DevOps
+      trigger:
+        branches:
+          include:
+            - main
+
+parameters:
+  - name: destroyInfra
+    displayName: Destroy all Azure infrastructure (terraform destroy) instead of deploying
+    type: boolean
+    default: false
+
+variables:
+  - template: templates/variables.yml
+
+  # Tool and chart versions - pinned, bump on purpose
+  - name: terraformVersion
+    value: 1.13.3
+  - name: kustomizeVersion
+    value: v5.7.1
+  - name: helmVersion
+    value: v3.18.6
+  - name: traefikChartVersion
+    value: 41.7.1
+  - name: certManagerChartVersion
+    value: v1.21.2
+  - name: kubePrometheusStackChartVersion
+    value: 92.13.1
+  - name: dynatraceOperatorChartVersion
+    value: 1.11.1
+
+  # Public hostnames: <env>.<domain>, admin.<env>.<domain>, auth.<env>.<domain>
+  # Empty = <ingress IP with dashes>.sslip.io (works without buying a domain).
+  # With your own domain: set it here and add DNS A records to the ingress IP.
+  - name: baseDomain
+    value: ''
+  # letsencrypt-prod | letsencrypt-staging | selfsigned (k8s/platform/cluster-issuers.yaml)
+  - name: tlsIssuer
+    value: letsencrypt-prod
+
+  # Entra ID object IDs with cluster-admin + Key Vault access besides the
+  # pipeline identity (az ad signed-in-user show --query id -o tsv).
+  # Passed to Terraform as TF_VAR_admin_object_ids.
+  - name: adminObjectIds
+    value: '["4a93547b-57cd-4311-a60d-2f8da2f01c92"]'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - ${{ if not(parameters.destroyInfra) }}:
+      # ===============================================================
+      - stage: Infra
+        displayName: Infrastructure (Terraform)
+        jobs:
+          - job: Terraform
+            steps:
+              - checkout: self
+
+              - bash: scripts/cd/install-tools.sh
+                displayName: Install terraform, kustomize, helm
+                env:
+                  TERRAFORM_VERSION: $(terraformVersion)
+                  KUSTOMIZE_VERSION: $(kustomizeVersion)
+                  HELM_VERSION: $(helmVersion)
+
+              - task: AzureCLI@2
+                displayName: Create Terraform state storage (if missing)
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: scriptPath
+                  scriptPath: scripts/cd/bootstrap-tfstate.sh
+
+              # Exit code of plan -detailed-exitcode: 0 = no changes,
+              # 1 = error, 2 = changes -> the apply step runs only on 2
+              - task: AzureCLI@2
+                name: plan
+                displayName: Terraform plan
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  addSpnToEnvironment: true
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: terraform
+                  inlineScript: |
+                    set -euo pipefail
+                    source ../scripts/cd/terraform-env.sh
+                    terraform init -lock-timeout=5m
+                    set +e
+                    terraform plan -lock-timeout=5m -detailed-exitcode -out=tfplan
+                    rc=$?
+                    set -e
+                    mkdir -p "$(Build.ArtifactStagingDirectory)/terraform"
+                    case $rc in
+                      0) echo "No infrastructure changes - apply is skipped."
+                         echo "##vso[task.setvariable variable=changes;isOutput=true]false" ;;
+                      2) echo "Infrastructure changes found - apply will run."
+                         echo "##vso[task.setvariable variable=changes;isOutput=true]true"
+                         terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/terraform/tfplan.txt" ;;
+                      *) exit $rc ;;
+                    esac
+                env:
+                  TF_VAR_admin_object_ids: $(adminObjectIds)
+
+              - task: AzureCLI@2
+                displayName: Terraform apply (only when the plan has changes)
+                condition: and(succeeded(), eq(variables['plan.changes'], 'true'))
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  addSpnToEnvironment: true
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: terraform
+                  inlineScript: |
+                    set -euo pipefail
+                    source ../scripts/cd/terraform-env.sh
+                    terraform apply -lock-timeout=5m -auto-approve tfplan
+
+              # Values the next stages need (none of them are secret)
+              - task: AzureCLI@2
+                name: tfout
+                displayName: Read Terraform outputs
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  addSpnToEnvironment: true
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: terraform
+                  inlineScript: |
+                    set -euo pipefail
+                    source ../scripts/cd/terraform-env.sh
+                    terraform output -json > outputs.json
+                    out() { jq -r ".$1.value" outputs.json; }
+                    for pair in resourceGroup:resource_group_name aksName:aks_cluster_name \
+                                ingressIp:ingress_public_ip ingressIpName:ingress_public_ip_name \
+                                keyVaultName:key_vault_name; do
+                      echo "##vso[task.setvariable variable=${pair%%:*};isOutput=true]$(out "${pair#*:}")"
+                      printf '  %-14s %s\n' "${pair%%:*}" "$(out "${pair#*:}")"
+                    done
+                    jq 'with_entries(.value |= .value)' outputs.json \
+                      > "$(Build.ArtifactStagingDirectory)/terraform/outputs.json"
+
+              - task: PublishPipelineArtifact@1
+                displayName: Publish Terraform plan and outputs
+                condition: succeededOrFailed()
+                inputs:
+                  targetPath: $(Build.ArtifactStagingDirectory)/terraform
+                  artifact: terraform-$(System.JobAttempt)
+
+      # ===============================================================
+      - stage: Platform
+        displayName: Ingress, certificates and observability
+        dependsOn: Infra
+        variables:
+          resourceGroup: $[ stageDependencies.Infra.Terraform.outputs['tfout.resourceGroup'] ]
+          aksName: $[ stageDependencies.Infra.Terraform.outputs['tfout.aksName'] ]
+          ingressIp: $[ stageDependencies.Infra.Terraform.outputs['tfout.ingressIp'] ]
+          ingressIpName: $[ stageDependencies.Infra.Terraform.outputs['tfout.ingressIpName'] ]
+          keyVaultName: $[ stageDependencies.Infra.Terraform.outputs['tfout.keyVaultName'] ]
+        jobs:
+          - job: Platform
+            timeoutInMinutes: 60
+            steps:
+              - checkout: self
+
+              - bash: scripts/cd/install-tools.sh
+                displayName: Install terraform, kustomize, helm
+                env:
+                  TERRAFORM_VERSION: $(terraformVersion)
+                  KUSTOMIZE_VERSION: $(kustomizeVersion)
+                  HELM_VERSION: $(helmVersion)
+
+              - task: AzureCLI@2
+                displayName: Install / upgrade Traefik and cert-manager
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    scripts/cd/aks-login.sh "$(resourceGroup)" "$(aksName)"
+
+                    helm repo add traefik https://traefik.github.io/charts
+                    helm repo add jetstack https://charts.jetstack.io
+                    helm repo update
+
+                    # Traefik's LoadBalancer Service takes the static IP made by Terraform
+                    helm upgrade --install traefik traefik/traefik \
+                      --version "$(traefikChartVersion)" \
+                      --namespace traefik --create-namespace \
+                      -f k8s/platform/traefik-values.yaml \
+                      --set "service.annotations.service\.beta\.kubernetes\.io/azure-pip-name=$(ingressIpName)" \
+                      --wait --timeout 10m
+
+                    helm upgrade --install cert-manager jetstack/cert-manager \
+                      --version "$(certManagerChartVersion)" \
+                      --namespace cert-manager --create-namespace \
+                      -f k8s/platform/cert-manager-values.yaml \
+                      --wait --timeout 10m
+
+                    kubectl apply -f k8s/platform/cluster-issuers.yaml
+
+                    ip=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    echo "Ingress IP: $ip (Terraform: $(ingressIp))"
+                    if [ "$ip" != "$(ingressIp)" ]; then
+                      echo "##vso[task.logissue type=error]Traefik did not get the static IP $(ingressIp)"
+                      exit 1
+                    fi
+                    helm list -A
+
+              - task: AzureKeyVault@2
+                displayName: Read the Grafana admin password from Key Vault
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  KeyVaultName: $(keyVaultName)
+                  SecretsFilter: grafana-admin-password
+                  RunAsPreJob: false
+
+              # Slack / Dynatrace - each optional
+              - task: AzureCLI@2
+                displayName: Read optional integrations from Key Vault
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: scriptPath
+                  scriptPath: scripts/cd/read-optional-secrets.sh
+                  arguments: $(keyVaultName)
+
+              - task: AzureCLI@2
+                displayName: Install / upgrade Prometheus, Grafana, Alertmanager, Dynatrace
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    domain="$(baseDomain)"
+                    if [ -z "$domain" ]; then
+                      domain="$(echo "$(ingressIp)" | tr . -).sslip.io"
+                    fi
+                    scripts/cd/aks-login.sh "$(resourceGroup)" "$(aksName)"
+                    DOMAIN="$domain" scripts/cd/install-observability.sh
+                env:
+                  TLS_ISSUER: $(tlsIssuer)
+                  KPS_VERSION: $(kubePrometheusStackChartVersion)
+                  DYNATRACE_CHART_VERSION: $(dynatraceOperatorChartVersion)
+                  # secret variables must be mapped explicitly
+                  GRAFANA_ADMIN_PASSWORD: $(grafana-admin-password)
+                  SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)
+                  DYNATRACE_API_TOKEN: $(DYNATRACE_API_TOKEN)
+                  DYNATRACE_INGEST_TOKEN: $(DYNATRACE_INGEST_TOKEN)
+
+      # ===============================================================
+      # dev -> qa -> prod: one template, the same images all the way
+      # (pipelines/templates/deploy-env.yml). Each stage lists Infra so
+      # it can read the Terraform outputs.
+      - template: templates/deploy-env.yml
+        parameters:
+          env: dev
+          dependsOn: [Infra, Platform]
+          resolveImages: true
+
+      - template: templates/deploy-env.yml
+        parameters:
+          env: qa
+          dependsOn: [Infra, DEV]
+
+      - template: templates/deploy-env.yml
+        parameters:
+          env: prod
+          dependsOn: [Infra, QA]
+
+  - ${{ if parameters.destroyInfra }}:
+      # ===============================================================
+      - stage: Destroy
+        displayName: Destroy all Azure infrastructure
+        jobs:
+          - job: Destroy
+            timeoutInMinutes: 90
+            steps:
+              - checkout: self
+
+              - bash: scripts/cd/install-tools.sh
+                displayName: Install terraform, kustomize, helm
+                env:
+                  TERRAFORM_VERSION: $(terraformVersion)
+                  KUSTOMIZE_VERSION: $(kustomizeVersion)
+                  HELM_VERSION: $(helmVersion)
+
+              - task: AzureCLI@2
+                displayName: Terraform destroy
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  addSpnToEnvironment: true
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  workingDirectory: terraform
+                  inlineScript: |
+                    set -euo pipefail
+                    source ../scripts/cd/terraform-env.sh
+                    terraform init -lock-timeout=5m
+
+                    # Release the static IP first: it stays attached to the
+                    # cluster's load balancer while Traefik's Service exists
+                    rg=$(terraform output -raw resource_group_name 2>/dev/null || true)
+                    aks=$(terraform output -raw aks_cluster_name 2>/dev/null || true)
+                    if [ -n "$rg" ] && [ -n "$aks" ] && az aks show -g "$rg" -n "$aks" -o none 2>/dev/null; then
+                      ../scripts/cd/aks-login.sh "$rg" "$aks"
+                      helm uninstall traefik -n traefik --wait || true
+                    fi
+
+                    terraform destroy -lock-timeout=5m -auto-approve
+                env:
+                  TF_VAR_admin_object_ids: $(adminObjectIds)

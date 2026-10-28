@@ -1,0 +1,144 @@
+{{- if .Values.aiops.enabled }}
+{{- $c := .Values.aiops -}}
+# =====================================================================
+# ai-service (AIOps): reads Prometheus, Alertmanager, Kubernetes and
+# (optionally) Dynatrace, and summarises them - with Azure OpenAI when
+# configured, rule-based otherwise. Admin-only API behind the admin host
+# at /api/ai (Keycloak token with the ADMIN role).
+#
+# Optional Secret credpay-aiops (created by the pipeline from Key Vault):
+#   OPENAI_ENDPOINT OPENAI_KEY OPENAI_DEPLOYMENT
+#   DYNATRACE_URL DYNATRACE_API_TOKEN
+# =====================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 4 }}
+automountServiceAccountToken: false
+---
+# Read-only view of this environment's workloads (pods, deployments,
+# events) - nothing else, and only in this namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-service-reader
+  labels:
+    {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, events, services]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-service-reader
+  labels:
+    {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-service-reader
+subjects:
+  - kind: ServiceAccount
+    name: ai-service
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 4 }}
+spec:
+  replicas: {{ $c.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" "ai-service") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 8 }}
+      annotations:
+        {{- include "credpay.configChecksum" . | nindent 8 }}
+        {{- with .Values.aiops.settingsChecksum }}
+        checksum/settings: {{ . | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: ai-service
+      automountServiceAccountToken: true # the Kubernetes API client needs it
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: ai-service
+          image: {{ include "credpay.image" (dict "key" "aiops" "image" $c.image) }}
+          ports:
+            - name: http
+              containerPort: 8010
+          envFrom:
+            - secretRef:
+                name: credpay-aiops
+                optional: true # without it: rule-based summaries, no Dynatrace
+          env:
+            - name: ENVIRONMENT
+              value: {{ .Values.environment | quote }}
+            - name: KUBERNETES_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ $c.prometheusUrl | quote }}
+            - name: ALERTMANAGER_URL
+              value: {{ $c.alertmanagerUrl | quote }}
+            - name: OIDC_ISSUER_URI
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: OIDC_ISSUER_URI }
+            - name: OIDC_AUDIENCE
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: OIDC_AUDIENCE }
+            - name: OIDC_JWKS_URI
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: OIDC_JWKS_URI }
+            - name: CORS_ALLOW_ORIGINS
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: ADMIN_PORTAL_URL }
+          readinessProbe:
+            httpGet: { path: /api/ai/health, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /api/ai/live, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "ai-service" "root" .) | nindent 4 }}
+spec:
+  selector:
+    {{- include "credpay.selectorLabels" (dict "name" "ai-service") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8010
+      targetPort: http
+{{- end }}

@@ -1,0 +1,20 @@
+# =====================================================================
+# Set $(reportArtifact) to the artifact name for this job's reports.
+#
+# An artifact name can be published only once per run, so when a failed
+# job is re-run, the retry publishes <name>-attempt<N> instead of failing.
+# =====================================================================
+parameters:
+  - name: name
+    type: string
+
+steps:
+  - bash: |
+      name="${{ parameters.name }}"
+      if [ "$(System.JobAttempt)" -gt 1 ]; then
+        name="$name-attempt$(System.JobAttempt)"
+      fi
+      echo "##vso[task.setvariable variable=reportArtifact]$name"
+      echo "Reports will be published as artifact: $name"
+    displayName: Name the report artifact
+    condition: succeededOrFailed()

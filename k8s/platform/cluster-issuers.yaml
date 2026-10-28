@@ -1,0 +1,45 @@
+# =====================================================================
+# Certificate issuers - an Ingress picks one with the annotation
+# cert-manager.io/cluster-issuer (set per environment in urls.env).
+#
+#   letsencrypt-prod     trusted certificates. Limit: 50 per week per
+#                        registered domain - sslip.io is shared by
+#                        everyone, so this can fail until the GoDaddy
+#                        domain is used.
+#   letsencrypt-staging  same flow, untrusted test certificates, high limits
+#   selfsigned           no internet needed; browsers show a warning
+# =====================================================================
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}

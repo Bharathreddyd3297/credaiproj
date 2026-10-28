@@ -1,0 +1,125 @@
+{{- $c := .Values.keycloak -}}
+# =====================================================================
+# Keycloak: login for both portals. Image built in CI from infra/keycloak
+# (CredPay theme + realm, health and metrics enabled). Data lives in the
+# PostgreSQL database keycloak_<env>; the realm is imported on the first
+# start only, with this environment's portal URLs.
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  labels:
+    {{- include "credpay.labels" (dict "name" "keycloak" "root" .) | nindent 4 }}
+spec:
+  replicas: {{ $c.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" "keycloak") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "credpay.labels" (dict "name" "keycloak" "root" .) | nindent 8 }}
+      annotations:
+        {{- include "credpay.configChecksum" . | nindent 8 }}
+        {{- include "credpay.dynatraceScrape" (dict "root" . "port" 9000 "path" "/metrics") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: keycloak
+          image: {{ include "credpay.image" (dict "key" "keycloak" "image" $c.image) }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000
+          env:
+            # Public URL (becomes the token issuer); TLS ends at the ingress
+            - name: KC_HOSTNAME
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: KEYCLOAK_URL }
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            # Database
+            - name: KC_DB_URL_HOST
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_HOST }
+            - name: KC_DB_URL_PORT
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: DB_PORT }
+            - name: KC_DB_URL_DATABASE
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: KEYCLOAK_DB_NAME }
+            - name: KC_DB_URL_PROPERTIES
+              value: {{ .Values.database.keycloakUrlProperties | quote }}
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_USERNAME }
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_PASSWORD }
+            # First admin of the master realm (used only on the first start)
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef: { name: keycloak-admin, key: username }
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: keycloak-admin, key: password }
+            # Portal URLs for the realm import (redirect URIs, web origins)
+            - name: CUSTOMER_PORTAL_URL
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: CUSTOMER_PORTAL_URL }
+            - name: ADMIN_PORTAL_URL
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: ADMIN_PORTAL_URL }
+          startupProbe:
+            httpGet: { path: /health/started, port: management }
+            periodSeconds: 5
+            failureThreshold: 60 # up to 5 minutes (first start creates the schema)
+          readinessProbe:
+            httpGet: { path: /health/ready, port: management }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/live, port: management }
+            periodSeconds: 20
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kc-tmp
+              mountPath: /opt/keycloak/data/tmp
+            - name: kc-transaction-logs
+              mountPath: /opt/keycloak/data/transaction-logs
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kc-tmp
+          emptyDir: {}
+        - name: kc-transaction-logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  labels:
+    {{- include "credpay.labels" (dict "name" "keycloak" "root" .) | nindent 4 }}
+spec:
+  selector:
+    {{- include "credpay.selectorLabels" (dict "name" "keycloak") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    # Health and Prometheus metrics (/metrics) - inside the cluster only
+    - name: management
+      port: 9000
+      targetPort: management

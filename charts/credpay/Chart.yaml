@@ -1,0 +1,13 @@
+apiVersion: v2
+name: credpay
+description: >-
+  CREDPAY - customer portal, admin portal, user-service, payment-service,
+  Keycloak and (optional) the AIOps service, with Prometheus monitoring.
+type: application
+# Chart version: bump when the templates change
+version: 1.0.0
+# Images are versioned separately (CI tag 1.0.<BuildId>, set per release)
+appVersion: "1.0"
+keywords: [credpay, keycloak, spring-boot, fastapi, react]
+maintainers:
+  - name: CREDPAY DevOps course

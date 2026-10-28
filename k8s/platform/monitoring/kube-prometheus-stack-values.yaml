@@ -1,0 +1,135 @@
+# =====================================================================
+# kube-prometheus-stack (Prometheus, Alertmanager, Grafana, node
+# exporter, kube-state-metrics) - one stack for the whole cluster.
+# Installed by the CD pipeline's Platform stage:
+#
+#   helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+#     -n monitoring -f k8s/platform/monitoring/kube-prometheus-stack-values.yaml \
+#     -f <generated: Grafana host, Alertmanager receivers>
+#
+# Which environments are monitored is decided by the CREDPAY chart:
+# environments with monitoring.enabled create ServiceMonitors,
+# PrometheusRules and dashboards (prod by default).
+# =====================================================================
+
+# Short, predictable names: monitoring-prometheus, monitoring-alertmanager,
+# monitoring-grafana (ai-service and the docs refer to them)
+fullnameOverride: monitoring
+
+# AKS runs the control plane itself: its components cannot be scraped,
+# and their default rules would only fire false alerts
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    # Pick up ServiceMonitors / PodMonitors / PrometheusRules from every
+    # namespace, not only those labelled with this Helm release
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    retention: 7d
+    retentionSize: 8GB
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 1536Mi }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # default storage class (AKS: managed-csi)
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 10Gi
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 10m, memory: 64Mi }
+      limits: { memory: 128Mi }
+  # Base routing. The pipeline adds the Slack receiver (webhook URL from
+  # Key Vault) in a generated values file - see scripts/cd/monitoring-values.sh
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: [alertname, namespace, service]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        # Always-firing heartbeat of the stack itself - never notify
+        - receiver: "null"
+          matchers: ['alertname = "Watchdog"']
+    receivers:
+      - name: "null"
+    # A critical alert silences the warnings for the same service
+    inhibit_rules:
+      - source_matchers: ['severity = "critical"']
+        target_matchers: ['severity = "warning"']
+        equal: [namespace, service]
+
+grafana:
+  # Admin login from the Secret grafana-admin (created from Key Vault)
+  admin:
+    existingSecret: grafana-admin
+    userKey: username
+    passwordKey: password
+  # Grafana 13 needs more than 384Mi while it starts (database migrations):
+  # with less it never got past the liveness probe on AKS
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+  persistence:
+    enabled: false # dashboards and data sources are provisioned from code
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL # CREDPAY dashboards live in the app namespaces
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+  # Exposed through Traefik at https://grafana.<domain> (host and issuer
+  # set by the pipeline)
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts: [grafana.example.invalid]
+    tls:
+      - secretName: grafana-tls
+        hosts: [grafana.example.invalid]
+  grafana.ini:
+    server:
+      root_url: https://grafana.example.invalid
+    analytics:
+      check_for_updates: false
+      reporting_enabled: false
+    users:
+      allow_sign_up: false
+
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 64Mi }
+
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+prometheusOperator:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }

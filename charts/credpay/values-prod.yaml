@@ -1,0 +1,43 @@
+# prod - deployed only after qa passes and a person approves the
+# credpay-prod environment in Azure DevOps.
+environment: prod
+
+# Keycloak stays at one replica: running several needs its cache
+# cluster (Infinispan over JGroups) configured - see docs/CD-PIPELINE.md.
+keycloak:
+  replicas: 1
+
+userService:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+paymentService:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+customerPortal:
+  replicas: 2
+
+adminPortal:
+  replicas: 2
+
+podDisruptionBudget:
+  enabled: true
+
+# Observability is configured for prod (one Prometheus/Grafana stack for
+# the whole cluster; only prod is scraped, alerted on and on dashboards)
+monitoring:
+  enabled: true
+  serviceMonitors: true
+  alertRules: true
+  dashboards: true
+  dynatraceMetrics: false # set to true by the pipeline when Dynatrace is configured
+
+aiops:
+  enabled: true

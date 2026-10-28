@@ -1,0 +1,2 @@
+# dev - every merge to main lands here automatically. Smallest footprint.
+environment: dev

@@ -1,0 +1,12 @@
+# =====================================================================
+# CredPay - optional overrides for running Terraform from a laptop.
+# The pipeline uses the defaults in variables.tf (plus TF_VAR_* from
+# pipelines/templates/variables.yml). Nothing here is secret, but the
+# real terraform.tfvars is git-ignored to keep personal values out.
+# =====================================================================
+
+# Your Entra ID object ID: az ad signed-in-user show --query id -o tsv
+admin_object_ids = ["00000000-0000-0000-0000-000000000000"]
+
+# environments = ["dev", "qa", "prod"]
+# vm_size      = "Standard_D2alds_v6"

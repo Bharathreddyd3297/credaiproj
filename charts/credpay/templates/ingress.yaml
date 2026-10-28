@@ -1,0 +1,77 @@
+{{- $customer := include "credpay.customerHost" . -}}
+{{- $admin := include "credpay.adminHost" . -}}
+{{- $auth := include "credpay.authHost" . -}}
+# =====================================================================
+# One ingress, three hosts, one TLS certificate (cert-manager)
+#   <customer host>  /api/payment -> payment-service, /api -> user-service,
+#                    /            -> customer-portal
+#   <admin host>     /api/ai -> ai-service (when aiops is enabled),
+#                    /api/admin/payments -> payment-service,
+#                    same APIs,    /            -> admin-portal
+#   <auth host>      /            -> keycloak
+# =====================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: credpay
+  labels:
+    {{- include "credpay.labels" (dict "name" "credpay" "root" .) | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.tls.issuer | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - secretName: {{ .Values.tls.secretName }}
+      hosts:
+        - {{ $customer | quote }}
+        - {{ $admin | quote }}
+        - {{ $auth | quote }}
+  rules:
+    - host: {{ $customer | quote }}
+      http:
+        paths:
+          - path: /api/payment
+            pathType: Prefix
+            backend:
+              service: { name: payment-service, port: { name: http } }
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: user-service, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: customer-portal, port: { name: http } }
+    - host: {{ $admin | quote }}
+      http:
+        paths:
+          {{- if .Values.aiops.enabled }}
+          - path: /api/ai
+            pathType: Prefix
+            backend:
+              service: { name: ai-service, port: { name: http } }
+          {{- end }}
+          # Admin payment APIs live in payment-service (/api/admin/users is user-service)
+          - path: /api/admin/payments
+            pathType: Prefix
+            backend:
+              service: { name: payment-service, port: { name: http } }
+          - path: /api/payment
+            pathType: Prefix
+            backend:
+              service: { name: payment-service, port: { name: http } }
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: user-service, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: admin-portal, port: { name: http } }
+    - host: {{ $auth | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: keycloak, port: { name: http } }

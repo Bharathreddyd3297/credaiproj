@@ -1,0 +1,306 @@
+# =====================================================================
+# Build one service: test -> analyse -> build image -> scan -> push
+#
+# The job only runs when DetectChanges marked the service as changed.
+# Each gate stops the job, so a failing service is never pushed:
+#   1. unit tests (java / python / node with a "test" script)
+#   2. SonarQube quality gate              (when sonar: true)
+#   3. docker build
+#   4. Trivy image scan: fixable HIGH/CRITICAL vulnerabilities fail the
+#      build; accepted risks live in <service>/.trivyignore (with expiry)
+#   5. push to ACR with the immutable tag  (when publish: true)
+#
+# Every report, pass or fail, is published as the artifact
+# reports-<service> (Summary -> Published):
+#   tests/       JUnit results          coverage/   coverage XML + HTML
+#   trivy/       image scan .json/.html/.txt/-junit.xml
+#   sonarqube/   quality gate, open issues, dashboard link
+# =====================================================================
+parameters:
+  - name: service          # image name, e.g. user-service
+    type: string
+  - name: path             # source folder; empty = same as service
+    type: string
+    default: ''
+  - name: language         # java | python | node | none (no unit tests)
+    type: string
+  - name: publish          # push the image to ACR
+    type: boolean
+    default: false
+  - name: sonar            # run SonarQube analysis + quality gate
+    type: boolean
+    default: false
+  - name: sonarSources     # source folder, relative to the service folder
+    type: string
+    default: src
+  - name: sonarProperties  # extra sonar.* lines for this language
+    type: string
+    default: ''
+
+jobs:
+  - job: ${{ replace(parameters.service, '-', '_') }}
+    displayName: ${{ parameters.service }}
+    timeoutInMinutes: 45
+    condition: eq(stageDependencies.Prepare.DetectChanges.outputs['detect.${{ replace(parameters.service, '-', '_') }}'], 'true')
+    variables:
+      imageRepository: $(imageRepositoryPrefix)/${{ parameters.service }}
+      reportsDir: $(Build.ArtifactStagingDirectory)/reports
+      DOCKER_BUILDKIT: 1
+    steps:
+      - checkout: self
+
+      # ---- 1. Unit tests + coverage ----------------------------------
+      - ${{ if eq(parameters.language, 'java') }}:
+          - bash: |
+              set -euo pipefail
+              export JAVA_HOME="$JAVA_HOME_21_X64"
+              mvn -B -ntp test
+            workingDirectory: ${{ coalesce(parameters.path, parameters.service) }}
+            displayName: Unit tests + coverage (Maven, JaCoCo)
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: ${{ coalesce(parameters.path, parameters.service) }}/target/surefire-reports/TEST-*.xml
+              testRunTitle: ${{ parameters.service }} unit tests
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish coverage
+            inputs:
+              summaryFileLocation: ${{ coalesce(parameters.path, parameters.service) }}/target/site/jacoco/jacoco.xml
+
+      - ${{ if eq(parameters.language, 'python') }}:
+          - task: UsePythonVersion@0
+            displayName: Use Python 3.12
+            inputs:
+              versionSpec: '3.12'
+
+          - bash: |
+              set -euo pipefail
+              python -m pip install --quiet -r requirements-dev.txt
+              python -m pytest --junitxml=test-results.xml --cov=app --cov-report=xml --cov-report=html
+            workingDirectory: ${{ coalesce(parameters.path, parameters.service) }}
+            displayName: Unit tests + coverage (pytest)
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: ${{ coalesce(parameters.path, parameters.service) }}/test-results.xml
+              testRunTitle: ${{ parameters.service }} unit tests
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish coverage
+            inputs:
+              summaryFileLocation: ${{ coalesce(parameters.path, parameters.service) }}/coverage.xml
+
+      - ${{ if eq(parameters.language, 'node') }}:
+          - task: UseNode@1
+            displayName: Use Node.js 22
+            inputs:
+              version: '22.x'
+
+          # Only services whose package.json has a "test" script (Vitest)
+          - bash: |
+              set -euo pipefail
+              if [ "$(npm pkg get scripts.test)" = "{}" ]; then
+                echo "No test script in package.json - no unit tests to run."
+                exit 0
+              fi
+              npm ci --no-audit --no-fund
+              npm test
+              echo "##vso[task.setvariable variable=hasUnitTests]true"
+            workingDirectory: ${{ coalesce(parameters.path, parameters.service) }}
+            displayName: Unit tests + coverage (npm test)
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: and(succeededOrFailed(), eq(variables.hasUnitTests, 'true'))
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: ${{ coalesce(parameters.path, parameters.service) }}/test-results.xml
+              testRunTitle: ${{ parameters.service }} unit tests
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish coverage
+            condition: and(succeeded(), eq(variables.hasUnitTests, 'true'))
+            inputs:
+              summaryFileLocation: ${{ coalesce(parameters.path, parameters.service) }}/coverage/cobertura-coverage.xml
+
+      # ---- 2. SonarQube analysis + quality gate -----------------------
+      - ${{ if parameters.sonar }}:
+          - task: SonarQubePrepare@7
+            displayName: Prepare SonarQube analysis
+            inputs:
+              SonarQube: $(sonarServiceConnection)
+              scannerMode: cli
+              configMode: manual
+              cliProjectKey: credpay-${{ parameters.service }}
+              cliProjectName: CREDPAY ${{ parameters.service }}
+              cliProjectVersion: $(imageTag)
+              cliSources: ${{ parameters.sonarSources }}
+              extraProperties: |
+                sonar.projectBaseDir=$(Build.SourcesDirectory)/${{ coalesce(parameters.path, parameters.service) }}
+                sonar.qualitygate.wait=true
+                sonar.qualitygate.timeout=300
+                ${{ parameters.sonarProperties }}
+
+          # Fails the job when the quality gate is red (sonar.qualitygate.wait)
+          - task: SonarQubeAnalyze@7
+            displayName: Run SonarQube analysis (waits for the quality gate)
+
+          - task: SonarQubePublish@7
+            displayName: Publish quality gate result
+            condition: succeededOrFailed()
+            inputs:
+              pollingTimeoutSec: '300'
+
+          # Save the gate status and open issues as files for the reports
+          # artifact. SonarQubePrepare puts the server URL and token in
+          # SONARQUBE_SCANNER_PARAMS. Best effort: never fails the build.
+          - bash: |
+              set -uo pipefail
+              out="$(reportsDir)/sonarqube"
+              mkdir -p "$out"
+              key="credpay-${{ parameters.service }}"
+              params="${SONARQUBE_SCANNER_PARAMS:-}"
+              [ -n "$params" ] || params='{}'
+              host=$(echo "$params" | jq -r '."sonar.host.url" // empty')
+              token=$(echo "$params" | jq -r '."sonar.token" // ."sonar.login" // empty')
+              if [ -z "$host" ]; then
+                echo "SonarQube server URL not found; skipping."
+                exit 0
+              fi
+              echo "$host/dashboard?id=$key" > "$out/dashboard-url.txt"
+              api() { curl -sSf -u "$token:" "$host/api/$1" -o "$out/$2"; }  # gitleaks:allow (variable, not a secret)
+              api "qualitygates/project_status?projectKey=$key" quality-gate.json \
+                && jq -r '"Quality gate: " + .projectStatus.status' "$out/quality-gate.json"
+              api "issues/search?componentKeys=$key&resolved=false&ps=500" open-issues.json \
+                && jq -r '"Open issues: \(.total)"' "$out/open-issues.json"
+              cat "$out/dashboard-url.txt"
+            displayName: Save SonarQube results
+            condition: succeededOrFailed()
+            continueOnError: true
+
+      # ---- 3. Build the image ----------------------------------------
+      - task: Docker@2
+        displayName: Build image
+        inputs:
+          command: build
+          containerRegistry: $(acrServiceConnection)
+          repository: $(imageRepository)
+          dockerfile: ${{ coalesce(parameters.path, parameters.service) }}/Dockerfile
+          buildContext: ${{ coalesce(parameters.path, parameters.service) }}
+          tags: $(imageTag)
+          arguments: >-
+            --label org.opencontainers.image.revision=$(Build.SourceVersion)
+            --label org.opencontainers.image.version=$(imageTag)
+
+      # ---- 4. Trivy image scan (gate) ---------------------------------
+      # Scan once to JSON, convert it to the report formats, then fail
+      # the job if any finding is left after .trivyignore.
+      - bash: |
+          set -euo pipefail
+          image="$(acrLoginServer)/$(imageRepository):$(imageTag)"
+          out="$(reportsDir)/trivy"
+          ignore=""
+          if [ -f "${{ coalesce(parameters.path, parameters.service) }}/.trivyignore" ]; then
+            ignore="--ignorefile /src/.trivyignore"
+            echo "Using accepted risks from ${{ coalesce(parameters.path, parameters.service) }}/.trivyignore"
+          fi
+          mkdir -p "$out"
+          trivy() {
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v trivy-cache:/root/.cache \
+              -v "$(Build.SourcesDirectory)/${{ coalesce(parameters.path, parameters.service) }}:/src:ro" \
+              -v "$out:/out" \
+              $(trivyImage) "$@"
+          }
+          trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed $ignore \
+            --format json --output /out/trivy-image.json "$image"
+          trivy convert --format template --template "@/contrib/junit.tpl" --output /out/trivy-image-junit.xml /out/trivy-image.json
+          trivy convert --format template --template "@/contrib/html.tpl" --output /out/trivy-image.html /out/trivy-image.json
+          trivy convert --format table --output /out/trivy-image.txt /out/trivy-image.json
+          cat "$out/trivy-image.txt"
+
+          found=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$out/trivy-image.json")
+          if [ "$found" -gt 0 ]; then
+            echo "##vso[task.logissue type=error]$found fixable HIGH/CRITICAL vulnerabilities in $image (see the reports-${{ parameters.service }} artifact)"
+            exit 1
+          fi
+          echo "No fixable HIGH/CRITICAL vulnerabilities."
+        displayName: Trivy image scan (fails on fixable HIGH/CRITICAL)
+
+      - task: PublishTestResults@2
+        displayName: Publish Trivy image results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(reportsDir)/trivy/trivy-image-junit.xml
+          testRunTitle: Trivy image scan - ${{ parameters.service }}
+          failTaskOnFailedTests: false
+
+      # ---- 5. Push to ACR --------------------------------------------
+      - ${{ if parameters.publish }}:
+          - task: Docker@2
+            displayName: Push image to ACR
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              command: push
+              containerRegistry: $(acrServiceConnection)
+              repository: $(imageRepository)
+              tags: $(imageTag)
+
+          # Record what was pushed: the CD pipeline deploys exactly these images
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/image"
+              echo "$(acrLoginServer)/$(imageRepository):$(imageTag)" > "$(Build.ArtifactStagingDirectory)/image/${{ parameters.service }}.txt"
+              echo "##vso[build.addbuildtag]${{ parameters.service }}"
+              echo "Pushed $(acrLoginServer)/$(imageRepository):$(imageTag)"
+            displayName: Record pushed image
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish image reference
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/image
+              artifact: image-${{ parameters.service }}
+
+      # ---- 6. Reports artifact (also when a gate failed) ---------------
+      - bash: |
+          set -uo pipefail
+          cd "${{ coalesce(parameters.path, parameters.service) }}"
+          copy() {   # copy <path> <reports subfolder>, if the path exists
+            if [ -e "$1" ]; then
+              mkdir -p "$(reportsDir)/$2"
+              cp -r "$1" "$(reportsDir)/$2/"
+            fi
+          }
+          copy target/surefire-reports tests      # java
+          copy target/site/jacoco      coverage
+          copy test-results.xml        tests      # python
+          copy coverage.xml            coverage
+          copy htmlcov                 coverage
+          copy coverage                coverage   # node (lcov, cobertura)
+          mkdir -p "$(reportsDir)"
+          echo "Reports collected:"
+          find "$(reportsDir)" -maxdepth 2 | sed "s|$(reportsDir)|  reports|"
+        displayName: Collect reports
+        condition: succeededOrFailed()
+
+      - template: report-artifact-name.yml
+        parameters:
+          name: reports-${{ parameters.service }}
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish reports
+        condition: succeededOrFailed()
+        inputs:
+          targetPath: $(reportsDir)
+          artifact: $(reportArtifact)

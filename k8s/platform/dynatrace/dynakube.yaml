@@ -1,0 +1,66 @@
+# =====================================================================
+# Dynatrace for CREDPAY prod - applied by the CD pipeline's Platform
+# stage ONLY when Key Vault has dynatrace-url, dynatrace-api-token and
+# dynatrace-data-ingest-token (Dynatrace Operator chart 1.11.1 first).
+#
+#   Full-stack monitoring (cloud-native): a OneAgent on every node, and
+#   code-level tracing injected into the pods of namespace credpay-prod.
+#   ActiveGate: Kubernetes API monitoring, routing of agent traffic.
+#
+# The pipeline replaces ENVIRONMENT_URL with the dynatrace-url secret
+# (e.g. https://abc12345.live.dynatrace.com) and creates the Secret
+# "dynakube" (apiToken, dataIngestToken) in namespace dynatrace.
+# Token scopes: see docs/OBSERVABILITY.md#dynatrace
+# =====================================================================
+apiVersion: dynatrace.com/v1beta6
+kind: DynaKube
+metadata:
+  name: credpay
+  namespace: dynatrace
+spec:
+  apiUrl: ENVIRONMENT_URL/api
+  # Secret "dynakube" in this namespace: apiToken + dataIngestToken
+  tokens: dynakube
+
+  # Add Kubernetes metadata (namespace, workload) to the prod pods' data
+  metadataEnrichment:
+    enabled: true
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: credpay-prod
+
+  oneAgent:
+    cloudNativeFullStack:
+      # Inject code modules only into CREDPAY prod pods (dev/qa untouched)
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: credpay-prod
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+      # Images from Dynatrace's public registry: the environment's own
+      # registry answered "not found" for the OneAgent image (trial tenant).
+      # Upgrade: newest tags at gallery.ecr.aws/dynatrace
+      image: public.ecr.aws/dynatrace/dynatrace-oneagent:1.347.70.20261023-222553
+      codeModulesImage: public.ecr.aws/dynatrace/dynatrace-codemodules:1.347.70.20261023-222553
+      # One OneAgent per node: on a full node it may evict an app pod
+      # (which the autoscaler then places on a new node) instead of
+      # waiting forever (class created by the operator chart)
+      priorityClassName: dynatrace-high-priority
+      oneAgentResources:
+        requests: { cpu: 100m, memory: 512Mi }
+        limits: { cpu: 300m, memory: 1Gi }
+
+  activeGate:
+    capabilities:
+      - routing
+      - kubernetes-monitoring
+      - dynatrace-api
+    # One ActiveGate for the cluster: on the user pool (8 GiB nodes), so the
+    # small system nodes keep room for their own OneAgent
+    nodeSelector:
+      kubernetes.azure.com/agentpool: user
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: 500m, memory: 1Gi }

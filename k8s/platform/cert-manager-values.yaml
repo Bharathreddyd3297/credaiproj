@@ -1,0 +1,18 @@
+# =====================================================================
+# cert-manager (Helm chart jetstack/cert-manager): issues and renews the
+# TLS certificates requested by Ingress annotations. Installed once per
+# cluster by the CD pipeline.
+# =====================================================================
+crds:
+  enabled: true
+
+resources:
+  requests: { cpu: 10m, memory: 64Mi }
+
+webhook:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+
+cainjector:
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }

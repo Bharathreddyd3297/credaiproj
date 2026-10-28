@@ -1,0 +1,49 @@
+# =====================================================================
+# Traefik ingress controller (Helm chart traefik/traefik)
+# Installed once per cluster by the CD pipeline:
+#   helm upgrade --install traefik traefik/traefik -n traefik \
+#     -f k8s/platform/traefik-values.yaml \
+#     --set service.annotations."service\.beta\.kubernetes\.io/azure-pip-name"=<ip name>
+#
+# Why Traefik: the ingress-nginx project was retired in March 2026
+# (https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/).
+# Traefik reads the same standard Ingress resources.
+# =====================================================================
+deployment:
+  replicas: 1
+
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+  name: traefik
+
+providers:
+  kubernetesIngress:
+    publishedService:
+      enabled: true # Ingress status shows the load balancer IP
+  kubernetesCRD:
+    enabled: false # only standard Ingress resources are used
+
+ports:
+  web:
+    # Plain HTTP -> HTTPS (Let's Encrypt HTTP-01 checks follow the redirect)
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+service:
+  type: LoadBalancer
+  spec:
+    # Keep the client's IP (X-Forwarded-For) and skip the extra node hop
+    externalTrafficPolicy: Local
+  # azure-pip-name is passed by the pipeline (static IP made by Terraform)
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { cpu: 500m, memory: 256Mi }
+
+accessLog:
+  enabled: true

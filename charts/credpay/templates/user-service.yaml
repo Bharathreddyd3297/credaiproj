@@ -1,0 +1,96 @@
+{{- $c := .Values.userService -}}
+# =====================================================================
+# user-service (Spring Boot): profiles, cards, admin APIs.
+# Owns the database schema: Flyway migrates it on start-up.
+# Metrics: /actuator/prometheus
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "user-service" "root" .) | nindent 4 }}
+spec:
+  {{- if not $c.autoscaling.enabled }}
+  replicas: {{ $c.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "credpay.selectorLabels" (dict "name" "user-service") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "credpay.labels" (dict "name" "user-service" "root" .) | nindent 8 }}
+      annotations:
+        {{- include "credpay.configChecksum" . | nindent 8 }}
+        {{- include "credpay.dynatraceScrape" (dict "root" . "port" 8080 "path" "/actuator/prometheus") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: user-service
+          image: {{ include "credpay.image" (dict "key" "userService" "image" $c.image) }}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: credpay-config
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_HOST }
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_USERNAME }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: credpay-db, key: DB_PASSWORD }
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: APP_DB_NAME }
+            # Keycloak's public URL is the token issuer; the signing keys
+            # are fetched inside the cluster
+            - name: SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI
+              valueFrom:
+                configMapKeyRef: { name: credpay-config, key: OIDC_JWKS_URI }
+            # Behind the ingress: trust X-Forwarded-Proto/Host so the
+            # app sees https://<host> (needed for the CORS origin check)
+            - name: SERVER_FORWARD_HEADERS_STRATEGY
+              value: native
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 5
+            failureThreshold: 36 # up to 3 minutes for Flyway + JVM start
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 20
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp # Tomcat work files
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  labels:
+    {{- include "credpay.labels" (dict "name" "user-service" "root" .) | nindent 4 }}
+spec:
+  selector:
+    {{- include "credpay.selectorLabels" (dict "name" "user-service") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
